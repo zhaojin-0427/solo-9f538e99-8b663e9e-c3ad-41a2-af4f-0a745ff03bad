@@ -11,8 +11,8 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .database import Database, RevisionConflict
-from .geometry import GeometryError, build_polygon_geojson
-from .models import RevisionIn, RevisionResult
+from .geometry import GeometryError, build_polygon
+from .models import BoundarySource, RevisionIn, RevisionResult
 
 def _database_path() -> str:
     # Read lazily so tests (and redeployed env) can override FLOOD_DB_PATH.
@@ -75,9 +75,10 @@ def upload_revision(relation_id: int, payload: RevisionIn, request: Request) -> 
     """
     error = None
     geometry = None
+    provenance = None
     status = "valid"
     try:
-        geometry = build_polygon_geojson(payload)
+        geometry, provenance = build_polygon(payload)
     except GeometryError as exc:
         status = "invalid"
         error = exc.to_detail()
@@ -91,6 +92,7 @@ def upload_revision(relation_id: int, payload: RevisionIn, request: Request) -> 
             input_payload=payload.model_dump(),
             geometry=geometry,
             error=error,
+            provenance=provenance,
         )
     except RevisionConflict as exc:
         raise HTTPException(
@@ -131,6 +133,113 @@ def read_revision(relation_id: int, revision: int, request: Request) -> Revision
     last_valid_row = _db(request).get_last_valid(relation_id)
     result.last_valid_revision = last_valid_row["revision"] if last_valid_row else None
     return result
+
+
+def _boundary_source(row: dict, source: str) -> BoundarySource:
+    """Build the provenance response from one valid stored revision.
+
+    The stored provenance was recorded while stitching (not derived from
+    coordinates), so each edge keeps its originating way and direction
+    even when ways were split, reversed or submitted in another order.
+    """
+    rings = [
+        {
+            "ring_index": index,
+            "role": ring["role"],
+            "edges": ring["edges"],
+        }
+        for index, ring in enumerate(row["provenance"]["rings"])
+    ]
+    return BoundarySource(
+        relation_id=row["relation_id"],
+        revision=row["revision"],
+        source=source,
+        geometry=row["geometry"],
+        rings=rings,
+    )
+
+
+@app.get(
+    "/relations/{relation_id}/revisions/{revision}/boundary-source",
+    response_model=BoundarySource,
+    tags=["provenance"],
+    summary="Trace every boundary edge back to its OSM way",
+)
+def read_revision_boundary_source(
+    relation_id: int, revision: int, request: Request
+) -> BoundarySource:
+    """Per-edge provenance for one stored revision.
+
+    Rings are ordered exactly like the GeoJSON ``coordinates`` array, and
+    ``edge_index`` pairs consecutive coordinates of that ring.  An invalid
+    revision has no polygon and therefore no boundary source (409, with
+    ``last_valid_revision`` in the payload).
+    """
+    db = _db(request)
+    row = db.get_revision(relation_id, revision)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "not_found", "message": "revision does not exist"},
+        )
+    if row["status"] != "valid" or row["provenance"] is None:
+        last_valid = db.get_last_valid(relation_id)
+        detail = (
+            "invalid revisions have no boundary source"
+            if row["status"] != "valid"
+            else "this stored revision predates boundary-source tracking"
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "relation_id": relation_id,
+                "revision": revision,
+                "status": row["status"],
+                "error": row["error"],
+                "last_valid_revision": last_valid["revision"] if last_valid else None,
+                "detail": (
+                    f"{detail}; fetch last_valid_revision for the previous "
+                    "valid polygon and its source"
+                ),
+            },
+        )
+    return _boundary_source(row, "revision")
+
+
+@app.get(
+    "/relations/{relation_id}/current/boundary-source",
+    response_model=BoundarySource,
+    tags=["provenance"],
+    summary="Trace every boundary edge of the currently served polygon",
+)
+def read_current_boundary_source(relation_id: int, request: Request) -> BoundarySource:
+    """Same contract as ``/current``: serving stops while the latest
+    revision is invalid (409), and the previous valid source stays
+    readable by revision number."""
+    db = _db(request)
+    latest = db.get_latest_revision(relation_id)
+    if latest is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "not_found", "message": "no revision stored for this relation"},
+        )
+    last_valid = db.get_last_valid(relation_id)
+    if latest["status"] == "valid" and latest["provenance"] is not None:
+        return _boundary_source(latest, "current")
+    return JSONResponse(
+        status_code=409,
+        content={
+            "relation_id": relation_id,
+            "revision": latest["revision"],
+            "status": latest["status"],
+            "error": latest["error"],
+            "last_valid_revision": last_valid["revision"] if last_valid else None,
+            "detail": (
+                "current revision is invalid and its face is not served; fetch "
+                "last_valid_revision for the previous polygon and its source"
+            ),
+        },
+    )
 
 
 @app.get(

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS revisions (
     status               TEXT    NOT NULL CHECK (status IN ('valid', 'invalid')),
     input_json           TEXT    NOT NULL,
     geometry_json        TEXT,
+    provenance_json      TEXT,
     error_code           TEXT,
     error_message        TEXT,
     error_way_ids_json   TEXT,
@@ -77,6 +78,12 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.execute(SCHEMA)
+                # Migrate databases created before provenance tracking.
+                columns = {
+                    row["name"] for row in conn.execute("PRAGMA table_info(revisions)")
+                }
+                if "provenance_json" not in columns:
+                    conn.execute("ALTER TABLE revisions ADD COLUMN provenance_json TEXT")
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -91,12 +98,23 @@ class Database:
         input_payload: dict,
         geometry: dict | None,
         error: dict | None,
+        provenance: dict | None = None,
     ) -> None:
         """Atomically persist one full revision.
+
+        Geometry and boundary provenance are written in the same
+        transaction and row as the raw input, so a reader can never
+        observe a valid revision with one of the two missing.
 
         Raises :class:`RevisionConflict` when ``revision`` is not strictly
         greater than every existing revision of the relation.
         """
+        if (geometry is None) != (provenance is None):
+            raise ValueError("geometry and provenance must be stored together")
+        if status == "valid" and (geometry is None or provenance is None):
+            raise ValueError("a valid revision requires geometry and provenance")
+        if status == "invalid" and (geometry is not None or provenance is not None):
+            raise ValueError("an invalid revision must not carry geometry/provenance")
         with self._connect() as conn:
             attempt = 0
             while True:
@@ -128,8 +146,8 @@ class Database:
                     """
                     INSERT INTO revisions (
                         relation_id, revision, status, input_json, geometry_json,
-                        error_code, error_message, error_way_ids_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        provenance_json, error_code, error_message, error_way_ids_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         relation_id,
@@ -137,6 +155,7 @@ class Database:
                         status,
                         json.dumps(input_payload, separators=(",", ":"), ensure_ascii=False),
                         json.dumps(geometry, separators=(",", ":")) if geometry else None,
+                        json.dumps(provenance, separators=(",", ":")) if provenance else None,
                         error["code"] if error else None,
                         error["message"] if error else None,
                         json.dumps(error["way_ids"]) if error else None,
@@ -165,6 +184,9 @@ class Database:
             "status": row["status"],
             "input": json.loads(row["input_json"]),
             "geometry": json.loads(row["geometry_json"]) if row["geometry_json"] else None,
+            "provenance": (
+                json.loads(row["provenance_json"]) if row["provenance_json"] else None
+            ),
             "error": error,
             "created_at": row["created_at"],
         }

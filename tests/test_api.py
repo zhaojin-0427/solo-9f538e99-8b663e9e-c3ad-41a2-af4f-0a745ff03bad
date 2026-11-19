@@ -8,7 +8,9 @@ import threading
 from fastapi.testclient import TestClient
 
 from app.database import Database
+from app.geometry import build_polygon
 from app.main import app
+from app.models import RevisionIn
 
 from .factories import (
     INNER_NODES,
@@ -168,11 +170,14 @@ def test_wal_files_are_persistent(db_path: str):
 def test_failed_transaction_leaves_no_half_revision(db_path: str, relation_id: int):
     db = Database(db_path)
     good = revision(1, SQUARE_NODES, [SQUARE_WAY])
-    db.save_revision(relation_id, 1, "valid", good, {"type": "Polygon"}, None)
+    geom, provenance = build_polygon(RevisionIn(**good))
+    db.save_revision(relation_id, 1, "valid", good, geom, None, provenance)
 
     # Force the INSERT to fail mid-transaction with a CHECK violation.
+    # (Geometry/provenance are present so the failure comes from the DB,
+    # not from the pairing guard.)
     try:
-        db.save_revision(relation_id, 2, "bogus-status", good, None, None)  # type: ignore[arg-type]
+        db.save_revision(relation_id, 2, "bogus-status", good, geom, None, provenance)  # type: ignore[arg-type]
     except Exception:
         pass
     else:  # pragma: no cover

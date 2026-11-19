@@ -29,6 +29,8 @@ FLOOD_DB_PATH=./flood.db uvicorn app.main:app --reload
 | GET  | `/relations/{relation_id}/revisions/{revision}` | 按修订号读取**原始输入 + 几何 + 状态** |
 | GET  | `/relations/{relation_id}/revisions` | 列出该关系全部修订号与状态 |
 | GET  | `/relations/{relation_id}/current` | 取当前供数面（最新有效修订） |
+| GET  | `/relations/{relation_id}/revisions/{revision}/boundary-source` | 按修订号取**边界溯源**（逐边对应原始 way） |
+| GET  | `/relations/{relation_id}/current/boundary-source` | 取当前供数面的边界溯源 |
 | GET  | `/health` | 健康检查 |
 
 ### 上传请求体
@@ -69,14 +71,62 @@ way id，当前面**停止供数**（`/current` 返回 409）：
 输入约束违例（超 8/32 上限、角色非法、修订号非递增等）返回 422 / 409，
 **不落库**。
 
+## 边界溯源
+
+数据员发现异常边时，用下面的接口把**供数 Polygon 的每一条边**追回原始
+OSM way 与节点对：
+
+```bash
+curl -s http://localhost:8000/relations/1/revisions/4/boundary-source
+```
+
+```json
+{
+  "relation_id": 1,
+  "revision": 4,
+  "source": "revision",
+  "geometry": {"type": "Polygon", "coordinates": [[[1,0], [1,1], [0,1], [0,0], [1,0]]]},
+  "rings": [
+    {
+      "ring_index": 0,
+      "role": "outer",
+      "edges": [
+        {"edge_index": 0, "from_node": 2, "to_node": 3, "way_id": 11, "way_forward": true},
+        {"edge_index": 1, "from_node": 3, "to_node": 4, "way_id": 13, "way_forward": false},
+        {"edge_index": 2, "from_node": 4, "to_node": 1, "way_id": 12, "way_forward": false},
+        {"edge_index": 3, "from_node": 1, "to_node": 2, "way_id": 14, "way_forward": true}
+      ]
+    }
+  ]
+}
+```
+
+- `rings` 的顺序与 `geometry.coordinates` 完全一致（外环在前，内环在后），
+  `ring_index` 即其下标；`role` 为 `outer` / `inner`。
+- `edge_index` 是该环内的边序号，`0` 对应首两点，`n` 对应第 `n` 与
+  `n+1` 个坐标；环的闭合重复点不额外产生边，故边数 = 坐标数 - 1。
+- `from_node` / `to_node` 是这条边在原 OSM 节点上的起止号。
+- `way_id` 是贡献该边的原始 way；`way_forward` 表示拼接时是否沿原 way
+  的 `node_refs` 顺序（`true`）还是反向遍历（`false`）。
+- 溯源在**拼接时**逐段记录，而不是事后按坐标反查：way 被拆成多段、需要
+  反向拼接、或上传时 way 顺序被打乱，每边仍准确对应其贡献 way；即便
+  多条边坐标重合也不会错配。
+
+`/current/boundary-source` 与 `/current` 同状态机：当前修订有效时返回
+（`source` 为 `"current"`）；当前修订无效时返回 409 并给出
+`last_valid_revision`，该旧有效修订的溯源仍可通过
+`/revisions/{revision}/boundary-source` 按号读取；无效修订本身**不提供**
+边界溯源（409，附其错误详情）。
+
 ## 一致性、原子性与持久化
 
 - SQLite 启用 **WAL + `synchronous=FULL`**：提交即 fsync，重启后数据可查；
   读不阻塞写，读者只能看到完整提交的修订。
 - 每次写入在单个 `BEGIN IMMEDIATE` 事务内完成"递增检查 + 插入"，进程内
   再以锁串行化；存储失败整体回滚，**不会留下半份修订**。
-- 原始输入、几何、状态同事务写入，因此并发上传与读取看到的同一修订三者
-  必然一致。
+- 原始输入、几何、状态、**边界溯源**同事务同行写入（`provenance_json`），
+  因此并发上传与读取看到的同一修订四者必然一致；存储层拒绝"有几何无溯源"
+  或"有溯源无几何"的半份写入。旧库启动时自动补列迁移。
 - 数据库位于挂载卷 `/data/flood.db`（环境变量 `FLOOD_DB_PATH` 可改）。
 
 ## 自测
@@ -89,4 +139,6 @@ pytest -q
 
 覆盖：单/多 way 拼接与反向、内环挖洞、缺节点、断环、分叉、T 型分叉、自交、
 内环触碰/越界、状态机恢复、修订号冲突、上下限校验、重启恢复、事务原子性、
-并发上传/读取、`/docs` 可用性。
+并发上传/读取、`/docs` 可用性；以及边界溯源：逐边 way/节点对/方向、分段
+反向拼接、输入 way 换序、内外环顺序、坐标重合不误配、无效修订 409、旧有效
+版按号可查、重启与并发读写不串版、旧库迁移。

@@ -15,11 +15,38 @@ Rules implemented (per the flood-analysis contract):
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 from shapely.geometry import LinearRing, Polygon, mapping
 from shapely.validation import explain_validity
 
 from .models import RevisionIn
+
+
+@dataclass(frozen=True)
+class Segment:
+    """One consecutive node pair of a stitched ring and where it came from.
+
+    ``forward`` says whether the pair is traversed in the same order as the
+    original way's ``node_refs`` (``True``) or in reverse (``False``).
+    Provenance is recorded while stitching, never by matching coordinates,
+    so duplicated / overlapping edges cannot be attributed to the wrong way
+    and reordering the input ways does not change the attribution.
+    """
+
+    way_id: int
+    forward: bool
+    from_node: int
+    to_node: int
+
+
+@dataclass
+class RingAssembly:
+    """A stitched ring: ordered node refs plus per-edge provenance."""
+
+    role: str
+    node_refs: list[int]
+    segments: list[Segment] = field(default_factory=list)
 
 
 class GeometryError(Exception):
@@ -36,12 +63,14 @@ class GeometryError(Exception):
         return {"code": self.code, "message": self.message, "way_ids": self.way_ids}
 
 
-def _assemble_ring(role: str, ways: list, nodes: dict[int, tuple[float, float]]) -> list[int]:
-    """Stitch ways of one role into a closed, ordered list of node ids.
+def _assemble_ring(role: str, ways: list, nodes: dict[int, tuple[float, float]]) -> RingAssembly:
+    """Stitch ways of one role into a closed, ordered ring.
 
     ``ways`` are all WayIn objects sharing the same role.  The returned
-    list keeps the closing node equal to the first node (OSM/GeoJSON
-    ring convention).
+    ``node_refs`` keep the closing node equal to the first node
+    (OSM/GeoJSON ring convention).  Each traversed node pair is recorded
+    together with the way it came from and whether it was traversed in
+    the original way's direction or reversed.
     """
     way_by_id = {w.id: w for w in ways}
 
@@ -98,7 +127,14 @@ def _assemble_ring(role: str, ways: list, nodes: dict[int, tuple[float, float]])
                 f"outer/inner role '{role}' consists of one way {only.id} that is not closed",
                 [only.id],
             )
-        return list(only.node_refs)
+        refs = list(only.node_refs)
+        return RingAssembly(
+            role=role,
+            node_refs=refs,
+            segments=[
+                Segment(only.id, True, refs[i], refs[i + 1]) for i in range(len(refs) - 1)
+            ],
+        )
 
     # Multiple ways: every endpoint must be shared by exactly two ways.
     bad_nodes = [node_id for node_id, inc in endpoints.items() if len(inc) != 2]
@@ -116,6 +152,10 @@ def _assemble_ring(role: str, ways: list, nodes: dict[int, tuple[float, float]])
     # Walk the chain, reversing segment orientations as needed.
     first_way = ways[0]
     ring_refs: list[int] = list(first_way.node_refs)
+    ring_segments: list[Segment] = [
+        Segment(first_way.id, True, ring_refs[i], ring_refs[i + 1])
+        for i in range(len(ring_refs) - 1)
+    ]
     used: set[int] = {first_way.id}
     while ring_refs[0] != ring_refs[-1]:
         current_end = ring_refs[-1]
@@ -129,12 +169,18 @@ def _assemble_ring(role: str, ways: list, nodes: dict[int, tuple[float, float]])
         next_id = candidates[0]
         next_refs = refs_of[next_id]
         if next_refs[0] == current_end:
-            addition = next_refs[1:]
+            walk = list(next_refs)
+            forward = True
         elif next_refs[-1] == current_end:
-            addition = list(reversed(next_refs[:-1]))
+            walk = list(reversed(next_refs))
+            forward = False
         else:  # pragma: no cover - endpoints map guarantees this cannot happen
             raise GeometryError("broken_ring", "internal stitching error", [next_id])
-        ring_refs.extend(addition)
+        ring_segments.extend(
+            Segment(next_id, forward, walk[i], walk[i + 1])
+            for i in range(len(walk) - 1)
+        )
+        ring_refs.extend(walk[1:])
         used.add(next_id)
         if len(used) > len(ways):  # pragma: no cover - defensive guard
             raise GeometryError("fork", "stitching loop did not terminate", sorted(used))
@@ -155,13 +201,23 @@ def _assemble_ring(role: str, ways: list, nodes: dict[int, tuple[float, float]])
             sorted(used),
         )
 
-    return ring_refs
+    return RingAssembly(role=role, node_refs=ring_refs, segments=ring_segments)
 
 
-def build_polygon_geojson(payload: RevisionIn) -> dict:
-    """Validate one revision and return its GeoJSON Polygon geometry.
+def build_polygon(payload: RevisionIn) -> tuple[dict, dict]:
+    """Validate one revision; return ``(geojson, provenance)``.
 
-    Raises :class:`GeometryError` on any topology / geometry violation.
+    ``provenance`` mirrors the GeoJSON ring structure exactly::
+
+        {"rings": [
+            {"role": "outer", "edges": [
+                {"edge_index": 0, "from_node": 1, "to_node": 2,
+                 "way_id": 10, "way_forward": true}, ...]}, ...]}
+
+    ``edge_index`` counts edges inside its own ring, starting at 0,
+    matching the consecutive node pairs of ``geometry["coordinates"]``
+    (the closing duplicate point does not add an edge).  Raises
+    :class:`GeometryError` on any topology / geometry violation.
     """
     nodes = {n.id: (n.lon, n.lat) for n in payload.nodes}
 
@@ -188,17 +244,17 @@ def build_polygon_geojson(payload: RevisionIn) -> dict:
             sorted(affected),
         )
 
-    outer_refs = _assemble_ring("outer", outer_ways, nodes)
+    outer = _assemble_ring("outer", outer_ways, nodes)
 
-    inner_refs_list: list[list[int]] = []
+    inner_assemblies: list[RingAssembly] = []
     if inner_ways:
         # Contract: at most one inner ring -> all inner ways must belong to it.
-        inner_refs_list = [_assemble_ring("inner", inner_ways, nodes)]
+        inner_assemblies = [_assemble_ring("inner", inner_ways, nodes)]
 
     def to_coords(refs: list[int]) -> list[tuple[float, float]]:
         return [nodes[ref] for ref in refs]
 
-    outer_coords = to_coords(outer_refs)
+    outer_coords = to_coords(outer.node_refs)
     try:
         outer_ring = LinearRing(outer_coords)
     except Exception as exc:  # pragma: no cover - shapely raises ValueError subclasses
@@ -212,8 +268,8 @@ def build_polygon_geojson(payload: RevisionIn) -> dict:
         )
 
     inner_rings: list[LinearRing] = []
-    for inner_refs in inner_refs_list:
-        inner_coords = to_coords(inner_refs)
+    for inner in inner_assemblies:
+        inner_coords = to_coords(inner.node_refs)
         try:
             inner_ring = LinearRing(inner_coords)
         except Exception as exc:  # pragma: no cover
@@ -249,4 +305,26 @@ def build_polygon_geojson(payload: RevisionIn) -> dict:
             [w.id for w in payload.ways],
         )
 
-    return mapping(polygon)
+    rings_meta = [
+        {
+            "role": assembly.role,
+            "edges": [
+                {
+                    "edge_index": index,
+                    "from_node": segment.from_node,
+                    "to_node": segment.to_node,
+                    "way_id": segment.way_id,
+                    "way_forward": segment.forward,
+                }
+                for index, segment in enumerate(assembly.segments)
+            ],
+        }
+        for assembly in [outer, *inner_assemblies]
+    ]
+    return mapping(polygon), {"rings": rings_meta}
+
+
+def build_polygon_geojson(payload: RevisionIn) -> dict:
+    """Validate one revision and return its GeoJSON Polygon geometry."""
+    return build_polygon(payload)[0]
+

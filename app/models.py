@@ -53,6 +53,34 @@ class ErrorDetail(BaseModel):
     way_ids: list[int] = Field(default_factory=list)
 
 
+class SegmentSource(BaseModel):
+    """Provenance of one directed edge of a ring."""
+
+    edge_index: int = Field(..., description="0-based edge index inside its ring")
+    from_node: int
+    to_node: int
+    way_id: int = Field(..., description="Input way that contributed this edge")
+    way_forward: bool = Field(
+        ...,
+        description="True when the edge follows the way's node_refs order, "
+        "False when the way was traversed in reverse while stitching",
+    )
+
+
+class RingSource(BaseModel):
+    ring_index: int = Field(..., description="Index into geometry['coordinates']")
+    role: Literal["outer", "inner"]
+    edges: list[SegmentSource]
+
+
+class BoundarySource(BaseModel):
+    relation_id: int
+    revision: int
+    source: Literal["revision", "current"]
+    geometry: dict = Field(..., description="The polygon these edges belong to")
+    rings: list[RingSource]
+
+
 class RevisionResult(BaseModel):
     relation_id: int
     revision: int
